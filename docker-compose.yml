@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  backend:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:///./voicecare.db
+      - CORS_ORIGINS=["http://localhost:3000"]
+      - STT_PROVIDER=elevenlabs
+      - TTS_PROVIDER=elevenlabs
+      - TRANSLATION_PROVIDER=auto
+    volumes:
+      - ./data:/app/data
+      - ./voicecare.db:/app/voicecare.db
+    networks:
+      - voicecare-network
+
+  frontend:
+    image: voicecare-frontend:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NEXT_PUBLIC_WS_URL=ws://localhost:8000
+    depends_on:
+      - backend
+    networks:
+      - voicecare-network
+
+networks:
+  voicecare-network:
+    driver: bridge
