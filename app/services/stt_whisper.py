@@ -116,7 +116,7 @@ class WhisperSTTService:
             
         except Exception as e:
             logger.error(f"Whisper transcription failed: {e}")
-            return {"text": "", "language": language or "en", "error": str(e)}
+            return {"text": "", "language": language or "en", "error": str(e), "no_speech": True}
     
     def _transcribe_sync(self, audio_path: str, language: Optional[str] = None) -> Dict[str, str]:
         """Synchronous transcription method."""
@@ -203,12 +203,13 @@ class WhisperSTTService:
                 text = " ".join(text_parts)
                 
                 if not text.strip():
-                    return {"text": "", "language": detected_language, "error": "No speech detected in audio"}
+                    return {"text": "", "language": detected_language, "error": "No speech detected in audio", "no_speech": True}
             
             return {
                 "text": text.strip(),
                 "language": detected_language,
-                "confidence": confidence
+                "confidence": confidence,
+                "no_speech": False
             }
             
         except Exception as e:

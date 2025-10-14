@@ -193,12 +193,16 @@ async def handle_voice_note_message(message_data: dict) -> None:
             else:
                 raise ValueError("Sender not part of conversation")
             
+            # Determine target language based on recipient preference
+            recipient = await user_crud.get_by_id(session, recipient_id)
+            target_lang = (recipient.preferred_lang if recipient and getattr(recipient, 'preferred_lang', None) else voice_note.target_lang)
+            
             # Create message record (without translation yet)
             message_create = MessageCreate(
                 conversation_id=voice_note.conversation_id,
                 sender_id=voice_note.sender_id,
                 source_lang=voice_note.source_lang,
-                target_lang=voice_note.target_lang,
+                target_lang=target_lang,
                 text_source=voice_note.text_source
             )
             
@@ -220,13 +224,13 @@ async def handle_voice_note_message(message_data: dict) -> None:
             translated_text = await openai_translation_service.translate(
                 voice_note.text_source,
                 voice_note.source_lang,
-                voice_note.target_lang
+                target_lang
             )
         else:
             translated_text = await libre_translate_service.translate(
                 voice_note.text_source,
                 voice_note.source_lang,
-                voice_note.target_lang
+                target_lang
             )
         
         # Record translation completion
@@ -270,7 +274,7 @@ async def handle_voice_note_message(message_data: dict) -> None:
         
         # Send to recipient with translated text and TTS
         play_now = {
-            "lang": voice_note.target_lang,
+            "lang": target_lang,
             "text": translated_text,
             "sender_gender": sender_gender,
             "sender_id": voice_note.sender_id
