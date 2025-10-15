@@ -32,8 +32,10 @@ class TranslationService:
         if source_lang == target_lang:
             return text
             
-        # Normalize language codes
-        source_code = self._normalize_lang_code(source_lang)
+        # Normalize language codes (allow 'auto' to trigger autodetect)
+        source_lang = (source_lang or "").strip().lower()
+        target_lang = (target_lang or "").strip().lower()
+        source_code = self._normalize_lang_code(source_lang) if source_lang and source_lang != "auto" else "auto"
         target_code = self._normalize_lang_code(target_lang)
         
         logger.info(f"Translating: '{text[:50]}...' ({source_code} → {target_code})")
@@ -49,7 +51,18 @@ class TranslationService:
                 target_code
             )
             
-            if result:
+            # If translation came back identical or empty, retry with autodetect
+            if not result or result.strip() == text.strip():
+                if source_code != "auto":
+                    logger.info("Translation unchanged/empty; retrying with source=auto")
+                    result = await loop.run_in_executor(
+                        None,
+                        self._translate_sync,
+                        text,
+                        "auto",
+                        target_code
+                    )
+            if result and result.strip():
                 logger.info(f"Translation successful: '{result[:50]}...'")
                 return result
             else:
@@ -64,7 +77,7 @@ class TranslationService:
         """Synchronous translation using deep-translator."""
         try:
             # Create translator for specific language pair
-            translator = GoogleTranslator(source=source_lang, target=target_lang)
+            translator = GoogleTranslator(source=source_lang if source_lang else "auto", target=target_lang)
             result = translator.translate(text)
             return result if result else None
         except Exception as e:

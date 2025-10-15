@@ -38,7 +38,7 @@ class OpenAISTTService:
         language: Optional[str] = None
     ) -> Dict[str, str]:
         if not self.client:
-            return {"text": "", "language": language or "en", "error": "OpenAI API key not configured"}
+            return {"text": "", "language": language or "en", "error": "OpenAI API key not configured", "no_speech": True}
 
         try:
             # OpenAI expects (filename, bytes, mimetype)
@@ -50,11 +50,13 @@ class OpenAISTTService:
 
             text = getattr(resp, 'text', '') or ''
             logger.info(f"OpenAI STT transcription: '{text[:100]}...'")
-            return {"text": text.strip(), "language": language or 'en'}
+            if not text.strip():
+                return {"text": "", "language": language or 'en', "error": "Empty transcription", "no_speech": True}
+            return {"text": text.strip(), "language": language or 'en', "no_speech": False}
 
         except Exception as e:
             logger.error(f"OpenAI STT failed: {e}")
-            return {"text": "", "language": language or "en", "error": str(e)}
+            return {"text": "", "language": language or "en", "error": str(e), "no_speech": True}
 
 
 openai_stt_service = OpenAISTTService()

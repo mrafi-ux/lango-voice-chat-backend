@@ -37,7 +37,7 @@ class ElevenLabsSTTService:
         # WebM/Opus at 16kHz typically needs ~6000 bytes for 0.5 seconds
         if len(audio_data) < 6000:
             logger.info(f"Audio too short for ElevenLabs STT ({len(audio_data)} bytes), skipping")
-            return {"text": "", "language": language or "en", "error": "Audio too short"}
+            return {"text": "", "language": language or "en", "error": "Audio too short", "no_speech": True}
 
         try:
             # Prepare multipart form
@@ -45,13 +45,13 @@ class ElevenLabsSTTService:
                 'xi-api-key': self.api_key,
             }
 
-            # Normalize 2-letter code for API
-            lang = (language or 'en')[:2]
-
+            # Prepare form data; only include language hint if provided
+            lang_hint = (language or '').strip()
             form_data = {
                 'model_id': self.model_id,
-                'language_code': lang,
             }
+            if lang_hint:
+                form_data['language_code'] = lang_hint[:2]
 
             # Use a single shared AsyncClient for the request
             async with httpx.AsyncClient(timeout=60) as client:
@@ -67,13 +67,13 @@ class ElevenLabsSTTService:
 
             if resp.status_code >= 400:
                 logger.error(f"ElevenLabs STT error {resp.status_code}: {resp.text}")
-                return {"text": "", "language": lang, "error": f"HTTP {resp.status_code}"}
+                return {"text": "", "language": (lang_hint or "en")[:2], "error": f"HTTP {resp.status_code}", "no_speech": True}
 
             data = resp.json()
 
             # ElevenLabs returns various shapes; try common fields
             text = data.get('text') or data.get('transcript') or data.get('content') or ''
-            detected_lang = data.get('language') or lang
+            detected_lang = data.get('language') or data.get('language_code') or data.get('detected_language') or (lang_hint[:2] if lang_hint else None)
             confidence = data.get('confidence') or None
             
             # Debug logging for ElevenLabs response
@@ -83,14 +83,14 @@ class ElevenLabsSTTService:
             # Check if we got empty text - this might indicate an issue
             if not text or not text.strip():
                 logger.warning(f"ElevenLabs STT returned empty text. Response: {data}")
-                return {"text": "", "language": lang, "error": "Empty transcription"}
+                return {"text": "", "language": (detected_lang or (lang_hint or "en")[:2]), "error": "Empty transcription", "no_speech": True}
 
             logger.info(f"ElevenLabs STT transcription: '{text[:100]}...' (lang: {detected_lang})")
-
             return {
                 "text": (text or '').strip(),
-                "language": detected_lang or lang,
-                "confidence": confidence
+                "language": (detected_lang or (lang_hint or "en")[:2]),
+                "confidence": confidence,
+                "no_speech": False
             }
 
         except Exception as e:

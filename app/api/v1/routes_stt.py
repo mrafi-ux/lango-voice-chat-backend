@@ -22,6 +22,7 @@ class STTResponse(BaseModel):
     confidence: Optional[float] = None
     provider: str = "whisper"
     error: Optional[str] = None
+    no_speech: bool = False
 
 
 @router.post("/transcribe", response_model=STTResponse)
@@ -123,7 +124,8 @@ async def transcribe_audio(
                 text="",
                 language=language or "en",
                 provider=provider,
-                error=result["error"]
+                error=result["error"],
+                no_speech=bool(result.get("no_speech", False))
             )
         
         # Successful transcription
@@ -134,7 +136,8 @@ async def transcribe_audio(
             text=result["text"],
             language=result["language"],
             confidence=result.get("confidence"),
-            provider=provider
+            provider=provider,
+            no_speech=bool(result.get("no_speech", False))
         )
         
     except HTTPException:
