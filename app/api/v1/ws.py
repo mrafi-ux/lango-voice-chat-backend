@@ -193,15 +193,33 @@ async def handle_voice_note_message(message_data: dict) -> None:
             else:
                 raise ValueError("Sender not part of conversation")
             
-            # Determine target language based on recipient preference
+            # Determine target language
             recipient = await user_crud.get_by_id(session, recipient_id)
-            target_lang = (recipient.preferred_lang if recipient and getattr(recipient, 'preferred_lang', None) else voice_note.target_lang)
+
+            # Helper to normalize language codes to base two-letter form
+            def _norm(code: str) -> str:
+                try:
+                    return (code or "").strip().lower().split("-")[0]
+                except Exception:
+                    return (code or "").strip().lower()
+
+            # Normalize languages once
+            source_lang_norm = _norm(voice_note.source_lang)
+            selected_lang_norm = _norm(voice_note.target_lang)
+            preferred_lang_norm = _norm(getattr(recipient, 'preferred_lang', '') or '') if recipient else ''
+
+            # Translate to selected language only in self chat; otherwise prefer recipient preferred
+            if recipient_id == voice_note.sender_id:
+                target_lang = selected_lang_norm
+            else:
+                target_lang = preferred_lang_norm or selected_lang_norm
             
             # Create message record (without translation yet)
             message_create = MessageCreate(
                 conversation_id=voice_note.conversation_id,
                 sender_id=voice_note.sender_id,
-                source_lang=voice_note.source_lang,
+                # Persist normalized source language for consistent WebSocket payloads
+                source_lang=source_lang_norm,
                 target_lang=target_lang,
                 text_source=voice_note.text_source
             )
@@ -213,8 +231,9 @@ async def handle_voice_note_message(message_data: dict) -> None:
                 message.id,
                 voice_note.sender_id,
                 recipient_id,
-                voice_note.source_lang,
-                voice_note.target_lang,
+                # Track normalized source language
+                source_lang_norm,
+                target_lang,
                 voice_note.client_sent_at
             )
         

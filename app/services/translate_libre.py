@@ -103,10 +103,43 @@ class TranslationService:
             "ko-KR": "ko",
             "ar-SA": "ar"
         }
-        
-        # Return mapped code or extract base language
-        base_lang = lang_map.get(lang_code, lang_code.split("-")[0])
-        return base_lang.lower()
+        # ISO 639-2 (3-letter) to ISO 639-1 (2-letter) mappings (common languages)
+        iso3_to_iso2 = {
+            "eng": "en", "spa": "es", "fra": "fr", "fre": "fr", "deu": "de", "ger": "de",
+            "ita": "it", "por": "pt", "rus": "ru", "zho": "zh", "chi": "zh", "jpn": "ja",
+            "kor": "ko", "ara": "ar", "hin": "hi", "tur": "tr", "pol": "pl", "nld": "nl",
+            "dut": "nl", "ukr": "uk", "vie": "vi", "urd": "ur", "fas": "fa", "per": "fa",
+            "ron": "ro", "rum": "ro", "ces": "cs", "cze": "cs", "ell": "el", "gre": "el",
+            "swe": "sv", "fin": "fi", "nor": "no", "dan": "da", "hun": "hu", "tha": "th",
+            "ben": "bn", "tam": "ta", "tel": "te", "mar": "mr", "mal": "ml", "kan": "kn",
+            "guj": "gu", "lit": "lt", "lav": "lv", "est": "et", "slk": "sk", "slo": "sk",
+            "slv": "sl", "hrv": "hr", "srp": "sr", "bul": "bg", "heb": "iw", "yid": "yi",
+            "amh": "am", "aze": "az", "kat": "ka", "kaz": "kk", "khm": "km", "lao": "lo",
+            "mkd": "mk", "mac": "mk", "mya": "my", "bur": "my", "nep": "ne", "pan": "pa",
+            "pus": "ps", "que": "qu", "ron": "ro", "sqi": "sq", "alb": "sq", "tgl": "tl",
+            "tuk": "tk", "ukr": "uk", "uzb": "uz", "yor": "yo", "zul": "zu"
+        }
+
+        code = (lang_code or "").strip()
+        if not code:
+            return ""
+        code_lower = code.lower()
+
+        # Allow explicit auto
+        if code_lower == "auto":
+            return "auto"
+
+        # Map known locale forms first
+        if code in lang_map:
+            return lang_map[code]
+
+        # Map 3-letter ISO codes
+        if len(code_lower) == 3 and code_lower in iso3_to_iso2:
+            return iso3_to_iso2[code_lower]
+
+        # Fallback: take base before dash (e.g., en-US -> en)
+        base_lang = code_lower.split("-")[0]
+        return base_lang
     
     def _fallback_translate(self, text: str, source_lang: str, target_lang: str) -> str:
         """Fallback translation when real translation fails."""

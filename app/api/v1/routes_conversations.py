@@ -48,8 +48,8 @@ async def create_or_get_conversation(
         if not user_b:
             raise HTTPException(status_code=404, detail=f"User B not found: {conversation_data.user_b_id}")
         
-        if conversation_data.user_a_id == conversation_data.user_b_id:
-            raise HTTPException(status_code=400, detail="Cannot create conversation with same user")
+        # if conversation_data.user_a_id == conversation_data.user_b_id:
+        #     raise HTTPException(status_code=400, detail="Cannot create conversation with same user")
         
         conversation = await conversation_crud.create_or_get(
             session, 
