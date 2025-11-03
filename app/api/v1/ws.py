@@ -273,7 +273,9 @@ async def handle_voice_note_message(message_data: dict) -> None:
             "lang": voice_note.target_lang,
             "text": translated_text,
             "sender_gender": sender_gender,
-            "sender_id": voice_note.sender_id
+            "sender_id": voice_note.sender_id,
+            # Attach original transcription
+            "original_text": voice_note.text_source
         }
         
         recipient_ws_response = WSMessageResponse(

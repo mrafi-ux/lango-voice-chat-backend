@@ -31,6 +31,8 @@ class TTSResponse(BaseModel):
     provider: str
     voice_used: Optional[str] = None
     needs_browser_fallback: bool = False
+    # Echo original text so clients can attach/display transcription with audio
+    original_text: Optional[str] = None
 
 
 @router.get("/voices")
@@ -118,7 +120,8 @@ async def synthesize_speech(request: TTSRequest) -> TTSResponse:
                 audio_base64="",
                 content_type=content_type,
                 provider=provider,
-                needs_browser_fallback=True
+                needs_browser_fallback=True,
+                original_text=request.text
             )
         
         # Encode audio to base64
@@ -131,7 +134,8 @@ async def synthesize_speech(request: TTSRequest) -> TTSResponse:
             content_type=content_type,
             provider=provider,
             voice_used=voice_used,
-            needs_browser_fallback=False
+            needs_browser_fallback=False,
+            original_text=request.text
         )
         
     except HTTPException:
@@ -143,5 +147,6 @@ async def synthesize_speech(request: TTSRequest) -> TTSResponse:
             audio_base64="",
             content_type="audio/wav",
             provider=settings.tts_provider,
-            needs_browser_fallback=True
+            needs_browser_fallback=True,
+            original_text=request.text if hasattr(request, "text") else None
         ) 
