@@ -1,7 +1,9 @@
 """WebSocket handler for real-time communication."""
 
 import json
-from typing import Dict, Set
+import base64
+import asyncio
+from typing import Dict, Set, Optional
 from datetime import datetime
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -17,6 +19,7 @@ from ...db.models import MessageStatus, Message
 from ...services.translate_libre import translate_service as libre_translate_service
 from ...services.translate_openai import openai_translation_service
 from ...services.metrics import metrics_service
+from ...services.tts_openai_realtime import openai_realtime_tts_service
 from ...workers.persist import schedule_background_task, persistence_worker
 from ...core.logging import get_logger
 from ...core.config import settings
@@ -112,7 +115,6 @@ async def handle_websocket(websocket: WebSocket, connection_id: str) -> None:
             try:
                 message_data = json.loads(data)
                 message_type = message_data.get("type")
-                
                 if message_type == "join":
                     await handle_join_message(message_data, connection_id)
                     current_user_id = message_data.get("user_id")
@@ -122,7 +124,21 @@ async def handle_websocket(websocket: WebSocket, connection_id: str) -> None:
                     logger.info(f"Processing voice note message from user {current_user_id}")
                     await handle_voice_note_message(message_data)
                     logger.info(f"Voice note message processing completed for user {current_user_id}")
+                elif message_type == "tts_stream_start":
+                    # Enforce single realtime route if configured for WebRTC
+                    if settings.use_openai_realtime and settings.openai_realtime_transport == "webrtc" and getattr(settings, "enforce_realtime_single_route", False):
+                        await websocket.send_text(json.dumps({"type": "error", "message": "Realtime transport is 'webrtc'. Use WebRTC client flow."}))
+                    else:
+                        await handle_tts_stream_start(websocket, message_data)
                     
+                elif message_type == "realtime_start":
+                    await handle_realtime_start(websocket, connection_id, message_data)
+                elif message_type == "realtime_audio_chunk":
+                    await handle_realtime_audio_chunk(connection_id, message_data)
+                elif message_type == "realtime_audio_end":
+                    await handle_realtime_audio_end(websocket, connection_id)
+                elif message_type == "realtime_translation_final":
+                    await handle_realtime_translation_final(message_data)
                 else:
                     error_msg = WSErrorResponse(
                         type="error",
@@ -203,6 +219,7 @@ async def handle_voice_note_message(message_data: dict) -> None:
             )
             
             message = await message_crud.create(session, message_create)
+            message_id = message.id
             
             # Start TTFA tracking
             metrics_service.start_ttfa_tracking(
@@ -244,29 +261,28 @@ async def handle_voice_note_message(message_data: dict) -> None:
             from sqlalchemy import select
             result = await session.execute(
                 select(Message)
-                .where(Message.id == message.id)
+                .where(Message.id == message_id)
                 .options(selectinload(Message.sender))
             )
             fresh_message = result.scalar_one()
-            
-            # Get sender gender for TTS voice selection
-            sender_gender = fresh_message.sender.gender if fresh_message.sender else None
-            # If no gender is set, use preferred_voice as a hint for voice selection
-            if not sender_gender and fresh_message.sender and fresh_message.sender.preferred_voice:
-                # Map common voice names to gender hints
-                voice_name = fresh_message.sender.preferred_voice.lower()
-                if any(male_name in voice_name for male_name in ['clyde', 'david', 'james', 'john', 'michael', 'robert', 'william', 'thomas', 'charles', 'daniel']):
-                    sender_gender = "male"
-                elif any(female_name in voice_name for female_name in ['rachel', 'valentina', 'sarah', 'emma', 'olivia', 'ava', 'isabella', 'sophia', 'charlotte', 'mia']):
-                    sender_gender = "female"
-            
-            # Create recipient response with translated text
-            fresh_message.text_translated = translated_text
-            recipient_message_response = MessageResponse.model_validate(fresh_message)
-            
-            # Create sender response with original text (no translation)
-            fresh_message.text_translated = None  # Sender sees original text
-            sender_message_response = MessageResponse.model_validate(fresh_message)
+
+        # Get sender gender for TTS voice selection
+        sender_gender = fresh_message.sender.gender if fresh_message.sender else None
+        # If no gender is set, use preferred_voice as a hint for voice selection
+        if not sender_gender and fresh_message.sender and fresh_message.sender.preferred_voice:
+            voice_name = fresh_message.sender.preferred_voice.lower()
+            if any(male_name in voice_name for male_name in ["clyde", "david", "james", "john", "michael", "robert", "william", "thomas", "charles", "daniel"]):
+                sender_gender = "male"
+            elif any(female_name in voice_name for female_name in ["rachel", "valentina", "sarah", "emma", "olivia", "ava", "isabella", "sophia", "charlotte", "mia"]):
+                sender_gender = "female"
+
+        # Create recipient response with translated text
+        fresh_message.text_translated = translated_text
+        recipient_message_response = MessageResponse.model_validate(fresh_message)
+
+        # Create sender response with original text (no translation)
+        fresh_message.text_translated = None  # Sender sees original text
+        sender_message_response = MessageResponse.model_validate(fresh_message)
         
         # Send to recipient with translated text and TTS
         play_now = {
@@ -327,3 +343,360 @@ async def handle_voice_note_message(message_data: dict) -> None:
     except Exception as e:
         logger.error(f"Failed to handle voice note: {e}")
         # Could send error back to sender here
+
+
+async def handle_tts_stream_start(websocket: WebSocket, message_data: dict) -> None:
+    """Stream TTS audio to the requesting websocket as JSON chunks.
+    Message schema example:
+    {"type":"tts_stream_start","text":"hello","lang":"en","voice_hint":"alloy","fmt":"mp3","sr":24000}
+    """
+    try:
+        text = message_data.get("text") or ""
+        lang = message_data.get("lang") or "en"
+        voice_hint = message_data.get("voice_hint")
+        fmt = (message_data.get("fmt") or settings.openai_tts_format or "mp3").lower()
+        sr = int(message_data.get("sr") or settings.openai_tts_sample_rate or 24000)
+
+        await websocket.send_text(json.dumps({"type": "tts_stream_start_ack"}))
+        metrics_service.record_tts_stream_start()
+
+        bytes_out = 0
+        import time as _time
+        _start = _time.time()
+        async for chunk in openai_realtime_tts_service.stream_tts(
+            text=text,
+            lang=lang,
+            voice_hint=voice_hint,
+            audio_format=fmt,
+            sample_rate_hz=sr,
+            connect_timeout=10.0,
+            read_timeout=60.0,
+            retries=1,
+        ):
+            if not chunk:
+                continue
+            bytes_out += len(chunk)
+            await websocket.send_text(
+                json.dumps({
+                    "type": "tts_stream_chunk",
+                    "data": base64.b64encode(chunk).decode("utf-8"),
+                    "fmt": fmt
+                })
+            )
+
+        elapsed = int((_time.time() - _start) * 1000)
+        metrics_service.record_tts_stream_end(bytes_out, elapsed)
+        await websocket.send_text(json.dumps({"type": "tts_stream_end", "bytes": bytes_out, "elapsed_ms": elapsed}))
+    except Exception as e:
+        metrics_service.record_tts_stream_error()
+        await websocket.send_text(json.dumps({"type": "tts_stream_error", "message": str(e)}))
+
+
+# --- OpenAI Realtime unified pipeline (STT -> translate -> TTS) ---
+
+_rt_sessions: Dict[str, dict] = {}
+
+
+async def handle_realtime_start(websocket: WebSocket, connection_id: str, message_data: dict) -> None:
+    """Initialize a Realtime session that will accept audio chunks and stream outputs.
+    Client should follow with multiple 'realtime_audio_chunk' messages and then 'realtime_audio_end'.
+    message_data: {type, target_lang, source_lang?, voice?, fmt?, sr?}
+    """
+    try:
+        target_lang = (message_data.get("target_lang") or "en").strip()
+        source_lang = (message_data.get("source_lang") or "auto").strip()
+        voice_hint = message_data.get("voice") or settings.openai_tts_voice or "alloy"
+        fmt = (message_data.get("fmt") or settings.openai_tts_format or "mp3").lower()
+        sr = int(message_data.get("sr") or settings.openai_tts_sample_rate or 24000)
+
+        # Open Realtime WS upstream
+        import websockets
+        model = (settings.openai_realtime_model or "gpt-4o-realtime-preview-2024-12")
+        logger.info(f"Realtime session start model={model} transport={settings.openai_realtime_transport}")
+        url = f"wss://api.openai.com/v1/realtime?model={model}"
+        headers = (
+            ("Authorization", f"Bearer {settings.openai_api_key}"),
+            ("OpenAI-Beta", "realtime=v1"),
+        )
+        ws = await websockets.connect(url, extra_headers=list(headers), ping_interval=None, max_size=None)
+
+        # Store session state
+        _rt_sessions[connection_id] = {
+            "ws": ws,
+            "voice": voice_hint,
+            "fmt": fmt,
+            "sr": sr,
+            "target_lang": target_lang,
+            "source_lang": source_lang,
+            "input_open": True,
+            "forwarder": None,
+        }
+
+        await websocket.send_text(json.dumps({"type": "realtime_start_ack"}))
+
+        # Start background forwarder that reads events and forwards to client
+        async def _forward_events():
+            try:
+                while True:
+                    raw = await _rt_sessions[connection_id]["ws"].recv()
+                    if isinstance(raw, (bytes, bytearray)):
+                        # Some servers may emit binary audio directly
+                        await websocket.send_text(json.dumps({
+                            "type": "tts_stream_chunk",
+                            "data": base64.b64encode(raw).decode("utf-8"),
+                            "fmt": fmt,
+                        }))
+                        continue
+                    msg = json.loads(raw)
+                    mtype = msg.get("type")
+                    if mtype == "response.transcript.delta":
+                        # Hypothetical event name for partial STT
+                        await websocket.send_text(json.dumps({"type": "stt_delta", "text": msg.get("delta", "")}))
+                    elif mtype == "response.translation.delta":
+                        await websocket.send_text(json.dumps({"type": "translation_delta", "text": msg.get("delta", "")}))
+                    elif mtype == "response.output_audio.delta":
+                        delta = msg.get("delta")
+                        if isinstance(delta, str):
+                            chunk = base64.b64decode(delta)
+                        elif isinstance(delta, (bytes, bytearray)):
+                            chunk = bytes(delta)
+                        else:
+                            chunk = b""
+                        if chunk:
+                            await websocket.send_text(json.dumps({
+                                "type": "tts_stream_chunk",
+                                "data": base64.b64encode(chunk).decode("utf-8"),
+                                "fmt": fmt,
+                            }))
+                    elif mtype in ("response.completed", "response.output_audio.done"):
+                        await websocket.send_text(json.dumps({"type": "realtime_done"}))
+                        break
+                    elif mtype == "error":
+                        await websocket.send_text(json.dumps({"type": "realtime_error", "message": str(msg.get("error"))}))
+                        break
+            except Exception as e:
+                await websocket.send_text(json.dumps({"type": "realtime_error", "message": str(e)}))
+
+        _rt_sessions[connection_id]["forwarder"] = asyncio.create_task(_forward_events())
+
+    except Exception as e:
+        await websocket.send_text(json.dumps({"type": "realtime_error", "message": str(e)}))
+
+
+async def handle_realtime_audio_chunk(connection_id: str, message_data: dict) -> None:
+    sess = _rt_sessions.get(connection_id)
+    if not sess or not sess.get("input_open"):
+        return
+    try:
+        audio_b64 = message_data.get("data")
+        if not audio_b64:
+            return
+        # Send append buffer event upstream
+        payload = {
+            "type": "input_audio_buffer.append",
+            "audio": audio_b64,
+        }
+        await sess["ws"].send(json.dumps(payload))
+    except Exception:
+        pass
+
+
+async def handle_realtime_audio_end(websocket: WebSocket, connection_id: str) -> None:
+    sess = _rt_sessions.get(connection_id)
+    if not sess:
+        await websocket.send_text(json.dumps({"type": "realtime_error", "message": "no session"}))
+        return
+    if not sess.get("input_open"):
+        return
+    try:
+        sess["input_open"] = False
+        # Commit audio and request response with translation + TTS
+        await sess["ws"].send(json.dumps({"type": "input_audio_buffer.commit"}))
+        await sess["ws"].send(json.dumps({
+            "type": "response.create",
+            "response": {
+                "instructions": (
+                    "Transcribe the user's speech, translate it to "
+                    f"{sess['target_lang']}, and speak the translated text."
+                ),
+                "modalities": ["audio","text"],
+                "audio": {
+                    "voice": sess["voice"],
+                    "format": sess["fmt"],
+                    "sample_rate_hz": sess["sr"],
+                },
+            },
+        }))
+    except Exception as e:
+        await websocket.send_text(json.dumps({"type": "realtime_error", "message": str(e)}))
+
+
+async def handle_realtime_translation_final(message_data: dict) -> None:
+    """On final translated text from sender, stream TTS to the recipient in real time.
+    Expected message_data fields:
+      - conversation_id: str
+      - sender_id: str
+      - target_lang: str
+      - text: str (final translated text)
+      - text_source?: str (original transcript)
+      - source_lang?: str
+      - voice_hint?: str
+      - fmt?: str, sr?: int
+    """
+    try:
+        conversation_id = message_data.get("conversation_id")
+        sender_id = message_data.get("sender_id")
+        target_lang = message_data.get("target_lang") or "en"
+        source_lang = message_data.get("source_lang") or "auto"
+        text = message_data.get("text") or ""
+        text_source = message_data.get("text_source") or message_data.get("transcript") or ""
+        voice_hint = message_data.get("voice_hint")
+        fmt = (message_data.get("fmt") or settings.openai_tts_format or "mp3").lower()
+        sr = int(message_data.get("sr") or settings.openai_tts_sample_rate or 24000)
+
+        if not conversation_id or not sender_id or not text or not text_source:
+            logger.warning("realtime_translation_final missing required fields")
+            return
+
+        recipient_id: Optional[str] = None
+        message_id: Optional[str] = None
+
+        # Find recipient from conversation
+        async with AsyncSessionLocal() as session:
+            conversation = await conversation_crud.get_by_id(session, conversation_id)
+            if not conversation:
+                logger.warning(f"Conversation not found: {conversation_id}")
+                return
+            if conversation.user_a_id == sender_id:
+                recipient_id = conversation.user_b_id
+            elif conversation.user_b_id == sender_id:
+                recipient_id = conversation.user_a_id
+            else:
+                logger.warning("Sender not part of conversation")
+                return
+
+            message_create = MessageCreate(
+                conversation_id=conversation_id,
+                sender_id=sender_id,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                text_source=text_source,
+            )
+
+            message = await message_crud.create(session, message_create)
+            message_id = message.id
+
+            metrics_service.start_ttfa_tracking(
+                message.id,
+                sender_id,
+                recipient_id,
+                source_lang,
+                target_lang,
+                message_data.get("client_sent_at"),
+            )
+
+        if not recipient_id or not message_id:
+            logger.warning("Realtime translation missing recipient_id or message_id")
+            return
+
+        # Record translation complete and persist translation
+        metrics_service.record_translation_completed(message_id)
+        schedule_background_task(
+            persistence_worker.persist_message_translation(message_id, text)
+        )
+
+        # Load message with sender relationship
+        async with AsyncSessionLocal() as session:
+            from sqlalchemy.orm import selectinload
+            from sqlalchemy import select
+
+            result = await session.execute(
+                select(Message)
+                .where(Message.id == message_id)
+                .options(selectinload(Message.sender))
+            )
+            fresh_message = result.scalar_one()
+
+        sender_gender = fresh_message.sender.gender if fresh_message.sender else None
+        fresh_message.text_translated = text
+
+        recipient_message_response = MessageResponse.model_validate(fresh_message)
+        recipient_ws_response = WSMessageResponse(
+            type="message",
+            message=recipient_message_response,
+            play_now={
+                "lang": target_lang,
+                "text": text,
+                "stream_realtime": True,
+                "fmt": fmt,
+                "sr": sr,
+                "sender_gender": sender_gender,
+                "sender_id": sender_id,
+                "original_text": text_source,
+            },
+        ).model_dump(mode="json")
+
+        fresh_message.text_translated = None
+        sender_message_response = MessageResponse.model_validate(fresh_message)
+        sender_ws_response = WSMessageResponse(
+            type="message",
+            message=sender_message_response,
+            play_now=None,
+        ).model_dump(mode="json")
+
+        metrics_service.record_ws_sent(message_id)
+
+        sent_to_recipient = await manager.send_to_user(recipient_id, recipient_ws_response)
+        sent_to_sender = await manager.send_to_user(sender_id, sender_ws_response)
+
+        if sent_to_recipient:
+            schedule_background_task(
+                persistence_worker.update_message_status(message_id, MessageStatus.DELIVERED)
+            )
+        else:
+            schedule_background_task(
+                persistence_worker.update_message_status(message_id, MessageStatus.SENT)
+            )
+            return
+
+        if not sent_to_sender:
+            logger.warning(f"Failed to confirm realtime message to sender: {message_id}")
+
+        # Notify recipient to start playback
+        await manager.send_to_user(recipient_id, {
+            "type": "tts_stream_start",
+            "message_id": message_id,
+            "fmt": fmt,
+            "sr": sr,
+        })
+
+        bytes_out = 0
+        async for chunk in openai_realtime_tts_service.stream_tts(
+            text=text,
+            lang=target_lang,
+            voice_hint=voice_hint,
+            audio_format=fmt,
+            sample_rate_hz=sr,
+            connect_timeout=10.0,
+            read_timeout=60.0,
+            retries=1,
+        ):
+            if not chunk:
+                continue
+            bytes_out += len(chunk)
+            await manager.send_to_user(recipient_id, {
+                "type": "tts_stream_chunk",
+                "message_id": message_id,
+                "data": base64.b64encode(chunk).decode("utf-8"),
+                "fmt": fmt,
+            })
+
+        await manager.send_to_user(recipient_id, {
+            "type": "tts_stream_end",
+            "message_id": message_id,
+            "bytes": bytes_out,
+            "sr": sr,
+        })
+
+    except Exception as e:
+        logger.error(f"Failed realtime_translation_final streaming: {e}")

@@ -4,12 +4,16 @@ from typing import Optional, List, Dict
 import base64
 
 from fastapi import APIRouter, Depends, HTTPException
+from starlette.responses import StreamingResponse
+import time
 from pydantic import BaseModel
 
 from ...core.config import settings
 from ...core.logging import get_logger
 from ...services.tts_elevenlabs import elevenlabs_tts_service
 from ...services.tts_openai import openai_tts_service
+from ...services.tts_openai_realtime import openai_realtime_tts_service
+from ...services.metrics import metrics_service
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -150,3 +154,47 @@ async def synthesize_speech(request: TTSRequest) -> TTSResponse:
             needs_browser_fallback=True,
             original_text=request.text if hasattr(request, "text") else None
         ) 
+
+
+@router.get("/stream")
+async def tts_stream(
+    text: str,
+    lang: str,
+    voice_hint: Optional[str] = None,
+    fmt: Optional[str] = None,
+    sr: Optional[int] = None,
+):
+    """Stream TTS audio via OpenAI Realtime (falls back to ElevenLabs if needed)."""
+    if settings.use_openai_realtime and settings.openai_realtime_transport == "webrtc" and getattr(settings, "enforce_realtime_single_route", False):
+        raise HTTPException(status_code=400, detail="Realtime transport is 'webrtc'. Use WebRTC client flow instead of HTTP stream.")
+    media_type = "audio/mpeg"
+    target_fmt = (fmt or settings.openai_tts_format or "mp3").lower()
+    if target_fmt in ("wav", "pcm16"):
+        media_type = "audio/wav"
+
+    async def gen():
+        start = time.time()
+        total = 0
+        metrics_service.record_tts_stream_start()
+        try:
+            async for chunk in openai_realtime_tts_service.stream_tts(
+                text=text,
+                lang=lang,
+                voice_hint=voice_hint,
+                audio_format=target_fmt,
+                sample_rate_hz=sr or settings.openai_tts_sample_rate or 24000,
+                connect_timeout=10.0,
+                read_timeout=60.0,
+                retries=1,
+            ):
+                total += len(chunk)
+                yield chunk
+        except Exception as e:
+            logger.error(f"Streaming TTS failed: {e}")
+            metrics_service.record_tts_stream_error()
+        finally:
+            elapsed = (time.time() - start) * 1000
+            logger.info(f"TTS stream done: {total} bytes in {elapsed:.0f}ms")
+            metrics_service.record_tts_stream_end(total, int(elapsed))
+
+    return StreamingResponse(gen(), media_type=media_type)

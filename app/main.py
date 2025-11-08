@@ -10,8 +10,10 @@ from .core.config import settings
 from .core.logging import get_logger
 from .db.seed import init_database
 from .api.v1 import routes_users, routes_conversations, routes_messages, routes_tts, routes_stt, routes_capabilities
+from .api.v1 import routes_realtime
 from .api.v1 import routes_auth
 from .api.v1.ws import handle_websocket
+from .services.metrics import metrics_service
 
 logger = get_logger(__name__)
 
@@ -77,6 +79,10 @@ app.include_router(
     tags=["tts"]
 )
 
+# Ensure direct route registration for streaming endpoint (avoids rare router import issues in tests)
+from .api.v1.routes_tts import tts_stream as _tts_stream
+app.add_api_route("/api/v1/tts/stream", _tts_stream, methods=["GET"], include_in_schema=False)
+
 app.include_router(
     routes_stt.router,
     prefix="/api/v1/stt",
@@ -87,6 +93,12 @@ app.include_router(
     routes_capabilities.router,
     prefix="/api/v1/capabilities",
     tags=["capabilities"]
+)
+
+app.include_router(
+    routes_realtime.router,
+    prefix="/api/v1/realtime",
+    tags=["realtime"]
 )
 
 app.include_router(
